@@ -1,0 +1,13 @@
+{
+  "name": "dsh-tailscale-surface",
+  "version": "1.0.0",
+  "description": "Tailscale serve surface for the DeepSeek Harness web GUI: canonical external URL narration, identity-gated privileged RPC relay, and same-origin exposure for plugin surfaces.",
+  "type": "module",
+  "main": "index.js",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "tailscale"
+  ],
+  "license": "MIT"
+}
