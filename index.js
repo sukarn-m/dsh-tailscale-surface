@@ -110,7 +110,20 @@ export function apply(ctx, config) {
       state.serveManageable = true
       const cfg = JSON.parse(sv.out)
       const backend = 'http://127.0.0.1:' + state.backendPort
-      const web = cfg.Web || {}
+      // Classic (non-service) serve keeps Web at the top level; service-based
+      // tailnets nest it under Services.<name>.Web. Merge both so rule
+      // discovery works on either layout.
+      const web = {}
+      const svcMap = cfg.Services || {}
+      Object.keys(svcMap).forEach((svcName) => {
+        const svcWeb = (svcMap[svcName] || {}).Web || {}
+        Object.keys(svcWeb).forEach((hostPort) => {
+          if (!(hostPort in web)) web[hostPort] = svcWeb[hostPort]
+        })
+      })
+      Object.keys(cfg.Web || {}).forEach((hostPort) => {
+        if (!(hostPort in web)) web[hostPort] = cfg.Web[hostPort]
+      })
       Object.keys(web).forEach((hostPort) => {
         const handlers = (web[hostPort] || {}).Handlers || {}
         Object.keys(handlers).forEach((path) => {
