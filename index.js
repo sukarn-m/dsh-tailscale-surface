@@ -37,9 +37,16 @@ import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { createRequire } from 'node:module'
+import crypto from 'node:crypto'
+import os from 'node:os'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 
 export const name = 'tailscale-surface'
+
+// Where the /login passcode's scrypt hash lives. Created once out-of-band by
+// gen_auth.js (see repo notes); 0600, outside the git tree. Re-read on every
+// POST so a rotation takes effect on the next request without a restart.
+const AUTH_FILE = join(os.homedir(), '.dsh', 'profiles', 'tailscale-surface', 'auth.json')
 
 // Services read directly as ctx.<name>. Only webServer is read directly;
 // shellEnv and systemPrompt are used through scoped ctx.inject([...]) below,
@@ -251,13 +258,14 @@ export function apply(ctx, config) {
 
   // Both routes read the `connection` service, so register them in one scope.
   //
-  // /login — stable re-authentication URL. dsh web's launch token rotates on
-  //   every restart and is otherwise only visible in the daemon log, so a
-  //   bookmarked device can't re-login after its 30-day cookie lapses. This
-  //   route reads the live launch token from the `connection` service and
-  //   302-redirects to /?token=<token> (relative, so the browser stays on the
-  //   host it used to reach /login and the cookie is minted for that
-  //   authority). Visiting it is the whole login flow.
+  // /login — stable re-authentication URL, gated by a local passcode. dsh
+  // web's launch token rotates on every restart and is otherwise only visible
+  // in the daemon log, so a bookmarked device can't re-login after its 30-day
+  // cookie lapses. This route verifies the passcode (scrypt hash stored in
+  // ~/.dsh/profiles/tailscale-surface/auth.json, 0600) and only then
+  // 302-redirects to /?token=<token>, reading the live launch token from the
+  // `connection` service. The passcode adds a credential on top of Tailscale
+  // identity (a compromised identity alone no longer reaches the daemon).
   //
   // / — bounce unauthenticated visitors to /login. The stock build serves the
   //   SPA index here via the webserver fallback seat, gating it with a bare
@@ -272,29 +280,92 @@ export function apply(ctx, config) {
     const conn = connCtx.connection
 
     if (config.login) {
+      const throttle = new Map() // ua -> { n, ts } for coarse brute-force damping
+      const THRESHOLD = 5, WINDOW_MS = 60 * 1000
+      const formPage = (err) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh login</title>
+<style>
+ body{display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#0b0e14;color:#e6e9ef;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+ form{width:min(92vw,360px);padding:32px 28px;background:#151a24;border:1px solid #232a38;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45)}
+ h1{margin:0 0 6px;font-size:17px;font-weight:600;letter-spacing:.2px}
+ p{margin:0 0 18px;font-size:13px;color:#8b95a7}
+ input{width:100%;box-sizing:border-box;padding:11px 12px;font-size:15px;border-radius:9px;border:1px solid #2c3547;background:#0f1420;color:#e6e9ef;outline:none}
+ input:focus{border-color:#4f6b9e}
+ button{margin-top:14px;width:100%;padding:11px;font-size:15px;font-weight:600;border:0;border-radius:9px;background:#3b82f6;color:#fff;cursor:pointer}
+ .err{margin:0 0 14px;font-size:13px;color:#f87171}
+</style></head>
+<body><form method="post">
+<h1>dsh</h1>
+<p>Enter the login passcode for this Tailscale surface.</p>
+${err ? '<p class="err">' + err + '</p>' : ''}
+<input type="password" name="p" autocomplete="current-password" autofocus placeholder="Passcode">
+<button type="submit">Sign in</button>
+</form></body></html>`
+
       connCtx.effect(() => connCtx.webServer.register({
         kind: 'exact',
         path: config.loginPath,
-        handler: (req, res) => {
-          if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
+        handler: async (req, res) => {
+          // Enforce the same trusted-host fence the rest of the surface uses.
+          // Only an untrusted Host (403) is rejected here; 401 (no cookie) is
+          // fine — this IS the login endpoint. Blocks cross-origin CSRF from
+          // driving a passcode login against a victim's session.
+          let rejection
+          try { rejection = conn.requestRejection({ headers: req.headers, method: req.method }) }
+          catch (e) { rejection = void 0 }
+          if (rejection === 403) { res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }); res.end(); return }
+          if (req.method === 'GET' || req.method === 'HEAD') {
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+            res.end(formPage())
+            return
+          }
+          if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+          // coarse brute-force damping (per-User-Agent, in-memory, best effort)
+          const ua = (req.headers['user-agent'] || 'unknown').slice(0, 200)
+          const now = Date.now()
+          const t = throttle.get(ua)
+          if (t && now - t.ts < WINDOW_MS && t.n >= THRESHOLD) {
+            res.writeHead(429, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '60' })
+            res.end('tailscale-surface: too many attempts; retry in a minute')
+            return
+          }
+          if (!t || now - t.ts >= WINDOW_MS) throttle.set(ua, { n: 0, ts: now })
+          const entry = throttle.get(ua); entry.n += 1
+          let raw = ''
+          try {
+            for await (const chunk of req) { raw += chunk; if (raw.length > 1300) break }
+          } catch { /* fall through to failure */ }
+          const submitted = new URLSearchParams(raw).get('p') || raw
+          let auth
+          try { auth = JSON.parse(await readFile(AUTH_FILE, 'utf8')) }
+          catch { auth = null }
+          const ok = (() => {
+            try {
+              if (!auth || auth.alg !== 'scrypt') return false
+              const salt = Buffer.from(auth.salt, 'base64')
+              const want = Buffer.from(auth.hash, 'base64')
+              const got = crypto.scryptSync(String(submitted), salt, want.length, { N: auth.N, r: auth.r, p: auth.p })
+              return got.length === want.length && crypto.timingSafeEqual(got, want)
+            } catch { return false }
+          })()
+          if (!ok) {
+            res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+            res.end(formPage('Incorrect passcode.'))
+            return
+          }
+          throttle.delete(ua)
           let token
           try {
             token = new URL(conn.authenticatedUrl('http://127.0.0.1/')).searchParams.get('token')
-          } catch (e) {
-            res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
-            res.end('tailscale-surface: connection service unavailable; cannot mint login token')
-            return
-          }
+          } catch (e) { token = null }
           if (typeof token !== 'string' || token.length === 0) {
             res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
             res.end('tailscale-surface: connection service returned no launch token')
             return
           }
-          res.writeHead(302, {
-            'location': '/?token=' + encodeURIComponent(token),
-            'cache-control': 'no-store',
-            'referrer-policy': 'no-referrer',
-          })
+          res.writeHead(302, { 'location': '/?token=' + encodeURIComponent(token), 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
           res.end()
         },
       }), 'tailscale-surface: login route')
