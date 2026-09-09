@@ -6,44 +6,94 @@
 //  - discovers the `tailscale serve` rule fronting this daemon and exports the
 //    canonical external URL (DSH_TS_URL shell variable, system-prompt section,
 //    /__ts/status route);
-//  - relays the 15 privileged /api methods for VERIFIED operator logins
-//    (tailscale serve injects Tailscale-User-Login and overwrites any
-//    client-supplied value — verified empirically), dispatching in-process via
-//    the apiProxy service. Direct local connections (no proxy headers) keep
-//    the stock loopback behavior. This also closes, for these methods, the
-//    Host-spoofing path that exists behind any Host-preserving proxy;
 //  - exposePath(): register auxiliary surfaces on the main origin instead of
-//    binding unreachable new ports.
+//    binding unreachable new ports;
+//  - stable login URL: dsh web 0.1.2-rc.1 authenticates the browser with a
+//    one-time launch token (?token=, printed to the daemon log, rotates every
+//    restart) exchanged for a 30-day signed cookie. To avoid hunting the log,
+//    this plugin registers /login (config.loginPath) which redirects to
+//    /?token=<current token>, reading the live launch token from the
+//    `connection` service. Bookmark it on each device; after a cookie lapse a
+//    single visit to /login re-mints the cookie.
+//
+// Ported from the 0.1.0-rc.7 build to the republished 0.1.2-rc.1 architecture.
+// The old build also hand-rolled an identity-gated relay for 15 privileged
+// /api methods (settings.*, credentials.*, agentPreset.*, host.*,
+// llm.discoverModels) over the `apiProxy` service. That service is GONE in
+// 0.1.2-rc.1: the web carrier now does its own auth (a one-time launch token
+// exchanged for an HMAC-signed HttpOnly SameSite=Strict cookie) plus a
+// Host/Origin browser-trust fence driven by `dsh web --trusted-host`. That
+// built-in auth already authorizes AND secures remote privileged access over
+// the tailscale surface — strictly stronger than the old Tailscale-User-Login
+// header allowlist (a signed cookie cannot be forged by a malicious local
+// page). The relay is therefore obsolete and has been removed; remote Settings
+// works through the built-in auth. Verified 2026-09-09:
+//   POST https://<surface>/api/settings/describe (cookie) -> 200 {ok:true}
+// If the dsh web carrier ever drops the `--trusted-host` fence or the cookie
+// auth, this plugin's DSH_TS_URL/prompt guidance still holds, but remote
+// privileged RPCs would need re-securing.
 import z from '@deepseek-ai/schemastery'
+import { execFile } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { createRequire } from 'node:module'
+import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 
 export const name = 'tailscale-surface'
 
+// Services read directly as ctx.<name>. Only webServer is read directly;
+// shellEnv and systemPrompt are used through scoped ctx.inject([...]) below,
+// which is the 0.1.2-rc.1 pattern (mirrors dsh-web-app). The old build also
+// injected subprocess/timer/apiProxy; those are gone now (tailscale is spawned
+// via node:child_process; the apiProxy relay is subsumed by built-in auth).
+export const inject = ['webServer']
+
 export const Config = z.object({
+  // operatorLogins was consumed by the removed relay; kept (ignored) so an
+  // existing cordis.patch.yml config block stays valid on the port.
   operatorLogins: z.array(String).default([]),
   servePort: z.natural().max(65535).default(8443),
   surfaceContext: z.boolean().default(true),
+  // Exact route that 302-redirects to /?token=<live launch token> so a
+  // bookmarked device can re-authenticate without the daemon log.
+  loginPath: z.string().default('/login'),
+  login: z.boolean().default(true),
+  // Also claim the exact '/' route so an unauthenticated browser visiting the
+  // bare root (401 "reopen the URL" in the stock build) is bounced to /login
+  // instead. When enabled, /login is the whole login flow end to end.
+  // Disable to restore the stock 401-at-root behavior.
+  root: z.boolean().default(true),
+  // Path to dist/index.html for rendering the authenticated index from our
+  // '/' route. Empty = resolve @deepseek-ai/dsh-web-frontend via require, the
+  // same file the daemon's own frontend-static plugin serves (profile tree
+  // symlinks to the shared npx cache, so it's the same physical file).
+  distIndex: z.string().default(''),
 })
 
-export const inject = ['subprocess', 'timer', 'webServer', 'apiProxy']
-
-// [wire method, apiProxy namespace, function]
-const RELAY_METHODS = [
-  ['settings.describe', 'settings', 'describe'],
-  ['settings.openDocument', 'settings', 'openDocument'],
-  ['settings.update', 'settings', 'update'],
-  ['settings.replace', 'settings', 'replace'],
-  ['settings.mutate', 'settings', 'mutate'],
-  ['credentials.describe', 'credentials', 'describe'],
-  ['credentials.set', 'credentials', 'set'],
-  ['credentials.unset', 'credentials', 'unset'],
-  ['agentPreset.read', 'agentPresets', 'read'],
-  ['agentPreset.copy', 'agentPresets', 'copy'],
-  ['agentPreset.openDocument', 'agentPresets', 'openDocument'],
-  ['agentPreset.remove', 'agentPresets', 'remove'],
-  ['host.pickDirectory', 'host', 'pickDirectory'],
-  ['host.openPath', 'host', 'openPath'],
-  ['llm.discoverModels', 'llm', 'discoverModels'],
-]
+// Run one `tailscale` CLI invocation and resolve { code, out, err }. Never
+// rejects: a timeout / spawn failure resolves to a nonzero code so the
+// discovery path treats it like any other "tailscale unavailable" state.
+// Uses node:child_process directly (dsh-web-app does the same for its browser
+// opener) rather than the `subprocess` service, whose handle shape changed
+// between the 0.1.0-rc.7 and 0.1.2-rc.1 builds.
+function runCli(args, timeoutMs) {
+  return new Promise((resolve) => {
+    execFile('tailscale', args, {
+      timeout: timeoutMs,
+      maxBuffer: 8 * 1024 * 1024,
+      env: scrubbedParentEnv(),
+    }, (error, stdout, stderr) => {
+      const out = Buffer.isBuffer(stdout) ? stdout.toString('utf8') : (stdout || '')
+      const errText = Buffer.isBuffer(stderr) ? stderr.toString('utf8') : (stderr || '')
+      let code = error ? 1 : 0
+      if (error) {
+        if (typeof error.code === 'number') code = error.code
+        else if (error.killed) code = 124 // timed out
+      }
+      resolve({ code, out, err: errText })
+    })
+  })
+}
 
 export function apply(ctx, config) {
   const state = {
@@ -51,46 +101,21 @@ export function apply(ctx, config) {
     serveHostPort: null, rulePresent: null, serveManageable: null,
     externalUrl: null, lastError: null, checkedAt: null,
   }
-  const relay = {
-    active: true, operatorLogins: config.operatorLogins.length,
-    methods: 0, relayed: 0, rejected: 0, local: 0, errors: 0,
-  }
   const exposed = []
-
-  async function cli(args, timeoutMs) {
-    const exe = await ctx.subprocess.resolveExecutable(args[0])
-    const handle = ctx.subprocess.spawn({
-      argv: [exe].concat(args.slice(1)),
-      cwd: '/',
-      stdio: { stdin: 'ignore', stdout: { maxBytes: 1048576 }, stderr: { maxBytes: 65536 } },
-      graceMs: 2000,
-    })
-    const cancelWatchdog = ctx.timeout(() => handle.terminate(), timeoutMs)
-    try {
-      const outcome = await handle.done
-      return {
-        code: outcome.exitCode,
-        out: handle.collected.stdout === undefined ? '' : handle.collected.stdout.readFrom(0).text,
-        err: handle.collected.stderr === undefined ? '' : handle.collected.stderr.readFrom(0).text,
-      }
-    } finally {
-      cancelWatchdog()
-    }
-  }
 
   function snapshot() {
     return {
       externalUrl: state.externalUrl, fqdn: state.fqdn, tailnetIP: state.tailnetIP,
       certOK: state.certOK, backendPort: state.backendPort, serveHostPort: state.serveHostPort,
       rulePresent: state.rulePresent, serveManageable: state.serveManageable,
-      privilegedRelay: relay, exposedPaths: exposed.slice(),
+      exposedPaths: exposed.slice(),
       lastError: state.lastError, checkedAt: state.checkedAt,
     }
   }
 
   async function health() {
     try {
-      const st = await cli(['tailscale', 'status', '--json'], 10000)
+      const st = await runCli(['status', '--json'], 10000)
       if (st.code !== 0) throw new Error('tailscale status failed: ' + st.err.trim())
       const d = JSON.parse(st.out)
       const self = d.Self || {}
@@ -99,7 +124,7 @@ export function apply(ctx, config) {
       state.certOK = (d.CertDomains || []).indexOf(state.fqdn) !== -1
       if (state.fqdn === '') throw new Error('no tailscale identity (Self.DNSName empty)')
       state.backendPort = ctx.webServer.port
-      const sv = await cli(['tailscale', 'serve', 'status', '--json'], 10000)
+      const sv = await runCli(['serve', 'status', '--json'], 10000)
       state.rulePresent = false
       state.serveHostPort = null
       state.externalUrl = null
@@ -159,8 +184,8 @@ export function apply(ctx, config) {
     ensureRule() {
       return refresh().then((snap) => {
         if (snap.rulePresent) return snap
-        const port = snap.backendPort === null ? config.servePortFallback || 3080 : snap.backendPort
-        return cli(['tailscale', 'serve', '--bg', '--https=' + String(config.servePort), 'http://127.0.0.1:' + String(port)], 15000).then((r) => {
+        const port = snap.backendPort === null ? 3080 : snap.backendPort
+        return runCli(['serve', '--bg', '--https=' + String(config.servePort), 'http://127.0.0.1:' + String(port)], 15000).then((r) => {
           if (r.code !== 0) throw new Error('serve rule add failed: ' + (r.err || r.out).trim())
           return health()
         })
@@ -182,97 +207,12 @@ export function apply(ctx, config) {
   }
   ctx.provide('tailscaleSurface', surface)
 
-  // ── identity-gated privileged relay ─────────────────────────────────────
-  const hget = (req, name) => {
-    const v = req.headers[name]
-    return typeof v === 'string' ? v : undefined
-  }
-  const sendJson = (res, status, obj) => {
-    const body = JSON.stringify(obj)
-    res.writeHead(status, {
-      'content-type': 'application/json',
-      'content-length': String(new TextEncoder().encode(body).length),
-    })
-    res.end(body)
-  }
-  const badRequest = (res, rpcId, message) => sendJson(res, 200, {
-    type: 'server-response',
-    rpcId: typeof rpcId === 'string' ? rpcId : 'invalid-request',
-    result: { ok: false, error: { code: 'bad-request', message, details: { issues: [] } } },
-  })
-  const readBody = (req, capBytes) => new Promise((resolve, reject) => {
-    const decoder = new TextDecoder()
-    let text = ''
-    let total = 0
-    let settled = false
-    const finish = (value) => { if (!settled) { settled = true; resolve(value) } }
-    req.on('data', (chunk) => {
-      if (settled) return
-      total += chunk.length
-      if (total > capBytes) { finish(null); return }
-      text += decoder.decode(chunk, { stream: true })
-    })
-    req.on('end', () => { text += decoder.decode(); finish(text) })
-    req.on('error', (e) => { if (!settled) { settled = true; reject(e) } })
-  })
-
-  for (const [method, ns, fn] of RELAY_METHODS) {
-    ctx.effect(() => ctx.webServer.register({
-      kind: 'exact',
-      path: '/api/' + method,
-      handler: async (req, res) => {
-        if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
-        const served = hget(req, 'tailscale-headers-info') !== undefined
-          || hget(req, 'tailscale-user-login') !== undefined
-          || hget(req, 'x-forwarded-for') !== undefined
-        if (served) {
-          const login = hget(req, 'tailscale-user-login')
-          if (login === undefined || config.operatorLogins.indexOf(login) === -1) {
-            relay.rejected += 1
-            res.writeHead(403)
-            res.end('forbidden')
-            return
-          }
-        } else {
-          relay.local += 1
-        }
-        const raw = await readBody(req, 16777216)
-        if (raw === null) { res.writeHead(413); res.end('payload too large'); return }
-        let envelope = null
-        try { envelope = JSON.parse(raw) } catch { envelope = null }
-        if (envelope === null || typeof envelope !== 'object'
-          || envelope.type !== 'client-request'
-          || typeof envelope.rpcId !== 'string'
-          || typeof envelope.method !== 'string'
-          || !('payload' in envelope)) {
-          badRequest(res, envelope && envelope.rpcId, 'invalid client-request message')
-          return
-        }
-        if (envelope.method !== method) {
-          badRequest(res, envelope.rpcId, 'method "' + envelope.method + '" does not match path "' + method + '"')
-          return
-        }
-        const namespace = ctx.apiProxy[ns]
-        const target = namespace === undefined ? undefined : namespace[fn]
-        if (typeof target !== 'function') { res.writeHead(404); res.end('not found'); return }
-        try {
-          const narrow = await target.call(namespace, { rpcId: envelope.rpcId, payload: envelope.payload })
-          relay.relayed += 1
-          sendJson(res, 200, { type: 'server-response', rpcId: narrow.rpcId, result: narrow.result })
-        } catch (e) {
-          relay.errors += 1
-          res.writeHead(500)
-          res.end('handler failure: ' + String(e && e.message ? e.message : e))
-        }
-      },
-    }), 'tailscale-surface: relay ' + method)
-    relay.methods += 1
-  }
-
   if (config.surfaceContext) {
-    const shellEnv = ctx.get('shellEnv')
-    if (shellEnv !== undefined) {
-      ctx.effect(() => shellEnv.register({
+    // DSH_TS_URL shell variable for agent shells/tools. Uses ctx.inject (the
+    // 0.1.2-rc.1 pattern dsh-web-app uses for shellEnv) rather than a bare
+    // ctx.get so it only registers when the shellEnv service is present.
+    ctx.inject(['shellEnv'], (runtimeCtx) => {
+      runtimeCtx.effect(() => runtimeCtx.shellEnv.register({
         name: 'tailscale-surface',
         variables: {
           DSH_TS_URL: {
@@ -281,20 +221,21 @@ export function apply(ctx, config) {
         },
         resolve: () => (state.externalUrl === null ? {} : { DSH_TS_URL: state.externalUrl }),
       }), 'tailscale-surface: shellEnv')
-    }
-    const systemPrompt = ctx.get('systemPrompt')
-    if (systemPrompt !== undefined) {
-      ctx.effect(() => systemPrompt.section({
+    })
+    // System-prompt section so the agent knows the canonical remote URL and
+    // the auth model for remote privileged access.
+    ctx.inject(['systemPrompt'], (promptCtx) => {
+      promptCtx.effect(() => promptCtx.systemPrompt.section({
         name: 'app:tailscale-surface',
         order: -97,
         text: () => {
           if (state.externalUrl === null) {
             return "Tailscale surface: not detected (yet). Until it is, treat every URL you would hand the user as suspect: their browser cannot resolve this host's 127.0.0.1 or LAN addresses. Check /__ts/status."
           }
-          return 'The user reaches this GUI remotely through Tailscale at ' + state.externalUrl + ". Their browser CANNOT resolve this host's 127.0.0.1, localhost, or LAN addresses. Every user-facing URL you emit or a plugin mints MUST start with " + state.externalUrl + ' (also in env DSH_TS_URL) — never http://127.0.0.1:PORT, localhost, or LAN IPs. To add an auxiliary UI or endpoint, register a same-origin route via the tailscaleSurface service (exposePath) or the webServer service instead of binding a new port; a fresh port is unreachable to the user. Privileged RPCs (settings, credentials, model discovery, agent presets) are relayed for verified operator logins through this surface, so remote Settings works; a 403 on them means the caller\'s tailnet login is not allowlisted.'
+          return 'The user reaches this GUI remotely through Tailscale at ' + state.externalUrl + ". Their browser CANNOT resolve this host's 127.0.0.1, localhost, or LAN addresses. Every user-facing URL you emit or a plugin mints MUST start with " + state.externalUrl + ' (also in env DSH_TS_URL) — never http://127.0.0.1:PORT, localhost, or LAN IPs. To add an auxiliary UI or endpoint, register a same-origin route via the tailscaleSurface service (exposePath) or the webServer service instead of binding a new port; a fresh port is unreachable to the user. Remote access — including privileged Settings RPCs (settings.*, credentials.*, agentPreset.*, host.*, llm.discoverModels) — is authorized by dsh web\'s own authentication: the browser completes a one-time launch-token login that mints a signed session cookie, and the daemon accepts this Tailscale hostname via its --trusted-host fence. If the user hits a 401 (their session cookie has lapsed or is new), tell them to open the stable re-login URL ' + state.externalUrl + '/login once — it mints a fresh cookie without needing the daemon log. A 403 means this Tailscale hostname is not in the daemon\'s trusted-host list.'
         },
       }), 'tailscale-surface: prompt section')
-    }
+    })
   }
 
   ctx.effect(() => ctx.webServer.register({
@@ -308,8 +249,134 @@ export function apply(ctx, config) {
     },
   }), 'tailscale-surface: status route')
 
+  // Both routes read the `connection` service, so register them in one scope.
+  //
+  // /login — stable re-authentication URL. dsh web's launch token rotates on
+  //   every restart and is otherwise only visible in the daemon log, so a
+  //   bookmarked device can't re-login after its 30-day cookie lapses. This
+  //   route reads the live launch token from the `connection` service and
+  //   302-redirects to /?token=<token> (relative, so the browser stays on the
+  //   host it used to reach /login and the cookie is minted for that
+  //   authority). Visiting it is the whole login flow.
+  //
+  // / — bounce unauthenticated visitors to /login. The stock build serves the
+  //   SPA index here via the webserver fallback seat, gating it with a bare
+  //   401 "reopen the URL" when the cookie is absent. By claiming an exact
+  //   '/' route (which takes precedence over the fallback seat) we keep the
+  //   token-exchange path intact (delegated to connection.authorizeIndex,
+  //   which mints the cookie and 303s) but replace the 401 for plain
+  //   unauthenticated GETs with a 302 to /login. The index itself is rendered
+  //   for already-authenticated requests the same way frontend-static does
+  //   (same dist/index.html, same base-href + index-injection taps).
+  ctx.inject(['connection'], (connCtx) => {
+    const conn = connCtx.connection
+
+    if (config.login) {
+      connCtx.effect(() => connCtx.webServer.register({
+        kind: 'exact',
+        path: config.loginPath,
+        handler: (req, res) => {
+          if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
+          let token
+          try {
+            token = new URL(conn.authenticatedUrl('http://127.0.0.1/')).searchParams.get('token')
+          } catch (e) {
+            res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
+            res.end('tailscale-surface: connection service unavailable; cannot mint login token')
+            return
+          }
+          if (typeof token !== 'string' || token.length === 0) {
+            res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
+            res.end('tailscale-surface: connection service returned no launch token')
+            return
+          }
+          res.writeHead(302, {
+            'location': '/?token=' + encodeURIComponent(token),
+            'cache-control': 'no-store',
+            'referrer-policy': 'no-referrer',
+          })
+          res.end()
+        },
+      }), 'tailscale-surface: login route')
+    }
+
+    if (config.root) {
+      // Locate dist/index.html. Prefer an explicit path; otherwise resolve
+      // @deepseek-ai/dsh-web-frontend the same way dsh-web-app does. The
+      // profile tree symlinks @deepseek-ai/* into the shared npx cache, so
+      // this is the identical file the daemon's frontend-static serves — no
+      // risk of serving a stale manifest.
+      let distIndex
+      try {
+        if (config.distIndex) {
+          distIndex = config.distIndex
+        } else {
+          const req2 = createRequire(import.meta.url)
+          distIndex = join(dirname(req2.resolve('@deepseek-ai/dsh-web-frontend/package.json')), 'dist', 'index.html')
+        }
+      } catch (e) {
+        distIndex = null
+      }
+      const renderIndex = async () => {
+        const raw = await readFile(distIndex, 'utf8')
+        return connCtx.webServer.renderIndex(raw).replace(/<head(?:\s[^>]*)?>/i, (open) => open + '<base href="/">')
+      }
+
+      connCtx.effect(() => connCtx.webServer.register({
+        kind: 'exact',
+        path: '/',
+        handler: async (req, res) => {
+          if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
+          let url
+          try { url = new URL(req.url ?? '/', 'http://x') } catch { url = new URL('/', 'http://x') }
+          const tokens = url.searchParams.getAll('token')
+          // Token-exchange path: let the daemon's own auth mint the cookie and
+          // 303 to clean '/' (or 401 on a bad token) — identical to stock.
+          if (tokens.length > 0) {
+            conn.authorizeIndex(req, res)
+            return
+          }
+          // No token: probe the Host fence + cookie without writing anything.
+          // undefined => authenticated; 401 => no valid cookie; 403 => host not
+          // trusted. Bounce anything not authenticated to the stable login URL.
+          let rejection
+          try {
+            rejection = conn.requestRejection({ headers: req.headers, method: req.method })
+          } catch (e) {
+            res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
+            res.end('tailscale-surface: connection service unavailable; cannot verify session')
+            return
+          }
+          if (rejection !== void 0) {
+            res.writeHead(302, {
+              'location': config.loginPath,
+              'cache-control': 'no-store',
+              'referrer-policy': 'no-referrer',
+            })
+            res.end()
+            return
+          }
+          // Authenticated: render the SPA index exactly as frontend-static does.
+          if (distIndex === null) {
+            res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
+            res.end('tailscale-surface: cannot resolve dist/index.html; frontend will not load')
+            return
+          }
+          try {
+            const body = await renderIndex()
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            res.end(body)
+          } catch (e) {
+            res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+            res.end('tailscale-surface: failed to render index: ' + (e && e.message ? e.message : e))
+          }
+        },
+      }), 'tailscale-surface: root route')
+    }
+  })
+
   refresh().then(
-    (snap) => console.log('tailscale-surface: ' + (snap.externalUrl === null ? 'no serve rule found for this daemon' : snap.externalUrl) + ' (privileged relay active: ' + relay.methods + ' methods, ' + relay.operatorLogins + ' operator login(s))'),
+    (snap) => console.log('tailscale-surface: ' + (snap.externalUrl === null ? 'no serve rule found for this daemon' : snap.externalUrl) + ' (remote privileged RPCs ride dsh web token/cookie auth + --trusted-host fence)'),
     () => {},
   )
 }
