@@ -75,6 +75,23 @@ export const Config = z.object({
   // same file the daemon's own frontend-static plugin serves (profile tree
   // symlinks to the shared npx cache, so it's the same physical file).
   distIndex: z.string().default(''),
+  // Force the dsh-client-ui-settings settings mirror to use 'host' persistence
+  // for this tailnet browser. Upstream 0.1.5-rc.2 picks 'memory' for every
+  // non-loopback origin and never reads the wire, so Settings > Models shows
+  // "settings are unavailable in this browser" even though the server-side
+  // /api/settings/describe RPC accepts the request from this exact surface
+  // (dsh web's own token/cookie auth + --trusted-host fence authorizes it;
+  // remote Settings works through that built-in auth, verified upstream in
+  // dsh-tailscale-surface#30-31). The patch claims the plugin bundle route
+  // for @deepseek-ai/dsh-client-ui-settings, replaces the persistence
+  // selection in the served JS, and self-disables the moment upstream no
+  // longer ships the buggy pattern (the route still claims the prefix but
+  // hands through unchanged). A tapIndex on the index also rewrites the
+  // affected entry's rev in __DSH_BOOT__ to a -patched suffix so any
+  // browser with the unpatched bundle still in its 1-year immutable cache
+  // sees a fresh URL on its next page load — no hard-refresh required.
+  // Set false to opt out (e.g. while reproducing the upstream bug).
+  settingsMirrorPatch: z.boolean().default(true),
 })
 
 // Run one `tailscale` CLI invocation and resolve { code, out, err }. Never
@@ -255,6 +272,104 @@ export function apply(ctx, config) {
       res.end(body)
     },
   }), 'tailscale-surface: status route')
+
+  // Settings > Models conditional patch (see Config.settingsMirrorPatch).
+  // Plugin bundles are served by the client-modules service at
+  // /plugins/??<pkg>/client.js[.map]&rev=<hash>. The combo concatenates
+  // several files but preserves source verbatim (only sourceURL/sourceMappingURL
+  // trailers are stripped), so the literal pattern below is searchable in
+  // any combo that includes @deepseek-ai/dsh-client-ui-settings.
+  //
+  // Earlier draft registered a longest-prefix-wins webServer route for the
+  // full /plugins/??@deepseek-ai/dsh-client-ui-settings prefix, but that
+  // never matched: webServer.match() keys on `pathname` (everything before
+  // the first `?`), which strips the `??@…` portion into the query string,
+  // so the longest prefix over the stripped pathname is just `/plugins`
+  // and the upstream /plugins route always wins. The fix is to wrap the
+  // upstream `bundleResource(method, url)` itself — it receives the full
+  // `req.url` (query string included), runs the resource-table lookup,
+  // and returns the body; an instance-property override on
+  // clientModules shadows the prototype method that both fetchBundle() and
+  // the serveBundle route handler call via `this.bundleResource(...)`.
+  //
+  // Source maps, non-JS bodies, HEAD requests, and bundles whose pattern
+  // no longer matches pass through unchanged.
+  if (config.settingsMirrorPatch) {
+    const SETTINGS_PKG = '@deepseek-ai/dsh-client-ui-settings'
+    const PATCH_PATTERN = /const persistence = ctx\.remote\.\$host\.isLoopback \? "host" : "memory";/
+    const PATCH_REPLACE = 'const persistence = "host";'
+    // Match the entry/batch URL property whose path begins with the dsh-
+    // client-ui-settings combo segment (so it catches both single-plugin
+    // entries and multi-plugin combos that include it, but never a sibling
+    // like dsh-client-ui-settings-models). The rev query sits at the end
+    // of the URL string; rewrite it to a -patched suffix so the browser
+    // sees a URL it has never cached (no immutable-cache miss), then fall
+    // through to the bundleResource wrap below. Idempotent: a second pass
+    // leaves already-rewritten URLs alone.
+    const BOOT_URL_PATTERN = /"url":"(\/plugins\/\?\?@deepseek-ai\/dsh-client-ui-settings\/[^"]+)"/g
+    const REV_PATTERN = /([?&])rev=([^&"\\]*)/
+
+    ctx.inject(['webServer', 'clientModules'], (patchCtx) => {
+      let patchObserved = false
+
+      // Bump the rev in the served __DSH_BOOT__ payload so the browser's
+      // existing immutable cache for the bundle URL does not keep serving
+      // the unpatched bytes it fetched before this plugin started
+      // intercepting. Without this, the user would have to hard-refresh
+      // once after installing the plugin.
+      patchCtx.effect(() => patchCtx.webServer.tapIndex((html) => {
+        return html.replace(BOOT_URL_PATTERN, (match, url) => {
+          if (url.includes('-patched')) return match
+          const bumped = url.replace(REV_PATTERN, (_, sep, rev) => `${sep}rev=${rev}-patched`)
+          return match.replace(url, bumped)
+        })
+      }), 'tailscale-surface: settings mirror persistence boot-URL bump')
+
+      // Wrap the upstream bundleResource so the bundle body that ultimately
+      // reaches the browser carries 'host' persistence regardless of which
+      // upstream route (exact combo, source map, batched combo) delivered
+      // it. Override is an own property on the service instance, so
+      // this.bundleResource(...) inside serveBundle/fetchBundle resolves
+      // to the wrapper instead of the prototype method.
+      patchCtx.effect(() => {
+        const cm = patchCtx.clientModules
+        const orig = cm.bundleResource.bind(cm)
+        cm.bundleResource = function (method, url) {
+          const result = orig(method, url)
+          if (result.status !== 200) return result
+          const ct = result.headers?.['content-type'] ?? ''
+          if (!ct.startsWith('text/javascript')) return result
+          if (method === 'HEAD') return result
+          const body = result.body
+          const text = typeof body === 'string' ? body : (Buffer.isBuffer(body) ? body.toString('utf8') : Buffer.from(body).toString('utf8'))
+          if (!PATCH_PATTERN.test(text)) {
+            // Upstream no longer ships the buggy pattern — hand through
+            // unchanged. The wrap cost is one extra Buffer allocation and
+            // one regex test per request for this package; trivial.
+            return result
+          }
+          const patched = text.replace(PATCH_PATTERN, PATCH_REPLACE)
+          if (!patchObserved) {
+            patchObserved = true
+            console.log('tailscale-surface: settings mirror persistence patch active — Settings > Models over Tailscale will use host persistence')
+          }
+          const buf = Buffer.from(patched, 'utf8')
+          return {
+            ...result,
+            body: buf,
+            headers: {
+              ...result.headers,
+              'content-length': String(buf.length),
+              // Override the upstream 1-year immutable cache so any browser
+              // that fetched this URL before the patch started intercepting
+              // revalidates on its next request.
+              'cache-control': 'no-store',
+            },
+          }
+        }
+      }, 'tailscale-surface: settings mirror persistence bundleResource wrap')
+    })
+  }
 
   // Both routes read the `connection` service, so register them in one scope.
   //

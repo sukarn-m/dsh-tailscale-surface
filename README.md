@@ -86,6 +86,7 @@ curl https://<your-node>.<tailnet>.ts.net:8443/__ts/status
 | `operatorLogins` | `[]` | tailnet logins treated as operator-equivalent for privileged methods (relay inactive when empty) |
 | `servePort` | `8443` | serve HTTPS port used when self-healing a missing rule (`ensureRule`) |
 | `surfaceContext` | `true` | register the prompt section + `DSH_TS_URL` |
+| `settingsMirrorPatch` | `true` | force the dsh-client-ui-settings settings mirror to use `'host'` persistence for this surface. Compensates for the upstream loopback gate (Settings > Models otherwise shows "settings are unavailable in this browser" because the browser-side mirror stays in a terminal `unavailable` state, even though the server-side `/api/settings/describe` RPC accepts the authenticated request). Self-disables the moment upstream removes the buggy pattern from `dsh-client-ui-settings`. See `Settings > Models conditional patch` below. |
 
 ## Security notes
 
@@ -96,6 +97,49 @@ curl https://<your-node>.<tailnet>.ts.net:8443/__ts/status
   who can reach the serve port — restrict the port in your tailnet ACL to
   your own devices/users.
 - Never put `funnel` in front of this GUI.
+
+## Settings > Models conditional patch
+
+Upstream `@deepseek-ai/dsh-client-ui-settings` 0.1.5-rc.2 selects the
+settings-mirror persistence from the browser's loopback fact:
+`persistence = $host.isLoopback ? "host" : "memory"`. For a non-loopback
+host the mirror is initialised to `status: "unavailable"` and its `load()`
+and `ensure()` early-return — the wire read never happens, so the Settings
+> Models page falls back to the literal string "settings are unavailable in
+this browser". The server-side `/api/settings/describe` RPC does accept the
+authenticated request from this surface (dsh web's own launch-token → signed
+cookie + `--trusted-host` fence authorizes it), so the only thing standing
+between the user and a working remote Settings > Models is the browser-side
+loopback gate.
+
+When `settingsMirrorPatch: true` (default), this plugin:
+
+1. registers a longest-prefix-wins `/plugins/??@deepseek-ai/dsh-client-ui-settings`
+   route on the web server. It calls the upstream `clientModules.bundleResource`
+   synchronously and rewrites the literal pattern
+   `const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";` to
+   `const persistence = "host";` in the served body. Source maps, non-JS
+   bodies, HEAD responses, and URLs whose pattern no longer matches pass
+   through unchanged.
+2. registers a `webServer.tapIndex` that rewrites the affected entry's `rev`
+   in `window.__DSH_BOOT__` to a `-patched` suffix. This forces the browser's
+   1-year immutable cache for the old URL to miss, so the patch takes effect
+   on the next page load — no hard-refresh required.
+
+**Self-disabling.** Both pieces only act when the upstream pattern is still
+present. The moment upstream `@deepseek-ai/dsh-client-ui-settings` drops or
+rewrites that line (e.g. adopting the config-field fix proposed in
+[deepseek-harness discussion #5829](https://github.com/deepseek-ai/deepseek-harness/discussions/5829)),
+the route still claims the prefix but hands the body through unchanged and
+the tap rewrite is a no-op (`-patched` already on the URL). Set
+`settingsMirrorPatch: false` to opt out manually.
+
+**Trust boundary.** Forcing `'host'` persistence on this surface is
+intentional only because this surface is already gated by dsh web's
+launch-token → signed cookie + `--trusted-host` fence. Do not enable this
+patch on a deployment where the loopback identity is meaningful (e.g.
+binding `dsh web` to `0.0.0.0` or fronting it with anything less strict than
+Tailscale identity + tailnet-ACL-restricted serve).
 
 ## Compatibility
 
