@@ -296,7 +296,16 @@ export function apply(ctx, config) {
   // no longer matches pass through unchanged.
   if (config.settingsMirrorPatch) {
     const SETTINGS_PKG = '@deepseek-ai/dsh-client-ui-settings'
-    const PATCH_PATTERN = /const persistence = ctx\.remote\.\$host\.isLoopback \? "host" : "memory";/
+    // Match the literal that selects the settings-mirror persistence from the
+    // browser's loopback fact. Use [$] to match a literal `$` (the
+    // backslash-dollar in a regex literal is parsed by the lexer as a bare
+    // `$` end-of-line anchor in JavaScript, so the obvious `\.\$` form
+    // silently never matches and the patch would never apply — see the
+    // regression that re-introduced "settings are unavailable in this
+    // browser" on Settings > Models over the Tailscale surface). `\s+`
+    // before `const` accepts the tab-indented upstream source; `\s*`
+    // between tokens accepts the upstream spacing exactly.
+    const PATCH_PATTERN = /const\s+persistence\s*=\s*ctx\.remote\.[$]host\.isLoopback\s*\?\s*"host"\s*:\s*"memory"\s*;/
     const PATCH_REPLACE = 'const persistence = "host";'
     // Match the entry/batch URL property whose path begins with the dsh-
     // client-ui-settings combo segment (so it catches both single-plugin
@@ -306,7 +315,14 @@ export function apply(ctx, config) {
     // sees a URL it has never cached (no immutable-cache miss), then fall
     // through to the bundleResource wrap below. Idempotent: a second pass
     // leaves already-rewritten URLs alone.
-    const BOOT_URL_PATTERN = /"url":"(\/plugins\/\?\?@deepseek-ai\/dsh-client-ui-settings\/[^"]+)"/g
+    //
+    // The URL is stored in the boot graph as a combo reference whose
+    // leading slash has been stripped (the browser resolves the
+    // app-directory-relative form), so accept either form. The leading
+    // slash requirement in an earlier version of this regex silently
+    // failed to match the actually-shipped form and disabled the rev
+    // bump — every restart had to be paired with a hard refresh.
+    const BOOT_URL_PATTERN = /"url":"(\/?plugins\/\?\?@deepseek-ai\/dsh-client-ui-settings\/[^"]+)"/g
     const REV_PATTERN = /([?&])rev=([^&"\\]*)/
 
     ctx.inject(['webServer', 'clientModules'], (patchCtx) => {
@@ -331,11 +347,20 @@ export function apply(ctx, config) {
       // it. Override is an own property on the service instance, so
       // this.bundleResource(...) inside serveBundle/fetchBundle resolves
       // to the wrapper instead of the prototype method.
+      //
+      // The upstream method is `async bundleResource(method, url)`, so the
+      // wrapper MUST be async and await `orig(...)` before inspecting
+      // status/headers/body — a previous version read `result.status` off
+      // the unawaited Promise (always undefined), which short-circuited
+      // every request to the upstream response untouched and silently
+      // disabled the patch. This regression re-introduced "settings are
+      // unavailable in this browser" on Settings > Models over the
+      // Tailscale surface even though the daemon was reachable.
       patchCtx.effect(() => {
         const cm = patchCtx.clientModules
         const orig = cm.bundleResource.bind(cm)
-        cm.bundleResource = function (method, url) {
-          const result = orig(method, url)
+        cm.bundleResource = async function (method, url) {
+          const result = await orig(method, url)
           if (result.status !== 200) return result
           const ct = result.headers?.['content-type'] ?? ''
           if (!ct.startsWith('text/javascript')) return result
